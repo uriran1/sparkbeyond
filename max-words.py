@@ -1,99 +1,92 @@
 #!/usr/bin/env python3
 
-import re
-import os
 import sys
 import time
-from enum import Enum
+import os
 from collections import Counter
-from datetime import datetime
-from collections import namedtuple
 from multiprocessing import Pool
 from typing import List, Tuple, Iterable    # for type hints, see [https://docs.python.org/3/library/typing.html]
+from enum import Enum
 
+from cli import CLI, CLI_type, Timetag, Numr_TM_Window
 
-class CLI_type(Enum):
-    NONE            = 0
-    BASIC           = 1
-    ADV_TIMESTAMP   = 2
-    ADV_HUMAN       = 3
+VERSION = '0.2'
 
-g_cli_type = CLI_type.NONE
+class Timetag_State(Enum):
+    TTS_NONE = 0             # not in time frame mode any more
+    TTS_OFF  = 1             # not in the time frame window, seek for start timetag
+    TTS_ON   = 2             #     in the time frame window, seek for stop  timetag
 
-month_val = { 'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr':  4, 'May':  5, 'Jun':  6,
-              'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12 }
+DO_NOT_SKIP = False
+SKIP        = True
+class Task:
+    def __init__(self, file_name:str, timetag=None, tt_lst:List=None):
+        self.file     = file_name
+        self.timetag  = timetag
+        self.tt_list  = tt_lst
+        self.tt_state = Timetag_State.TTS_OFF
+        self.tt_indx  = 0                       # index to the next tt_list item
 
-class Adv_Human_State(Enum):
-    HAVENT_STARTED  = 0
-    READING         = 1
-    STOPPED_READING = 2
+    def skip_numeric_tt_line(self, tt:int) -> bool:
+        if self.tt_state == Timetag_State.TTS_NONE:
+            return SKIP         # no more active time-windows
+        time_to_start = self.tt_list[self.tt_indx].start
+        time_to_stop  = self.tt_list[self.tt_indx].stop
+        if self.tt_state == Timetag_State.TTS_OFF:
+            # is it time to read lines?
+            if tt < time_to_start:
+                return SKIP
+            elif tt >= time_to_stop:
+                return SKIP
+            else:
+                self.tt_state = Timetag_State.TTS_ON
+                return DO_NOT_SKIP
+        elif self.tt_state == Timetag_State.TTS_ON:
+            # is it time to stop reading lines?
+            if tt >= time_to_stop:
+                self.tt_state = Timetag_State.TTS_OFF
+                self.tt_indx += 1
+                if self.tt_indx >= len(self.tt_list):
+                    self.tt_state = Timetag_State.TTS_NONE
+                return SKIP
+            else:
+                return DO_NOT_SKIP
+        else:
+            print("assert, unknown self.tt_state {}".format(self.tt_state))
 
-Timestamp_alpha = namedtuple('Timestamp_alpha', 'start end')
-def next_timestamp(ts:Iterable[Timestamp_alpha]) -> Timestamp_alpha:
-    for dt in ts:
-        yield dt
-    return
+class File_Handle:
+    def __init__(self, task_lst):
+        self.task_list = task_lst
+        self.time_tag  = None
+        self.tt_list   = None   # list of time frame windows
 
-MINYEAR = 2018
-class Adv_Human:
-    time_windows    = []                    # timestamp tuples
-    start_timestamp = datetime(MINYEAR,1,1) # timestamp of the current block
-    stop_timestamp  = datetime(MINYEAR,1,1) # timestamp of the current block
-    state           = Adv_Human_State.HAVENT_STARTED
-    get_next_twind  = next_timestamp(time_windows)
-    def should_start(line:str) -> bool:
-        return False
-
-    def should_stop(line:str) -> bool:
-        return False
-
-    def update_datetime():
-        t_window = Adv_Human.get_next_twind()
-        if t_window:
-            print("px {}".format(t_window))
-           #Adv_Human.start_timestamp = 
-           #Adv_Human.stop_timestamp = 
+    def file_handle(self, file_name:str, timetag=None, tt_lst:List=None) -> None:
+        self.task_list.append(Task(file_name, timetag, tt_lst))
 
 def ignore_file(path:str) -> bool:
-    for suffix in [ '.asl', '.gz', '.bz2', '.bin', '.pklg', 'StoreData' ]:
+    for suffix in [ '.asl', '.gz', '.bz2', '.bin', '.pklg', 'StoreData', '.swp', '.pyc', '.pdf' ]:
         if path.endswith(suffix):
             return True
     else:
         return False
 
-def should_read_line(line:str) -> bool:
-    global g_cli_type
-    if g_cli_type == CLI_type.BASIC:
-        return True
-    if g_cli_type == CLI_type.ADV_HUMAN:
-        if Adv_Human.state == Adv_Human_State.STOPPED_READING:
-            return False
-        if Adv_Human.state == Adv_Human_State.HAVENT_STARTED:
-            if Adv_Human.should_start(line):
-                Adv_Human.state = Adv_Human_State.READING
-                return True
-            else:
-                return False
-        if Adv_Human.state == Adv_Human_State.READING:
-            if Adv_Human.should_stop(line):
-                Adv_Human.state = Adv_Human_State.STOPPED_READING
-                return False
-            else:
-                return True
-    return False
-
-def score_file_words(path:str) -> Counter:
+def score_file_words(t:Task) -> Counter:
+    path = t.file
     c = Counter()
     try:
         with open(path, 'r') as f:
-            if g_cli_type == CLI_type.ADV_HUMAN:
-               #Adv_Human.update_datetime()
-                pass
             try:
                 for line in f:
-                    if should_read_line(line):
-                        words = line.split()
-                        c.update(Counter(words))
+                    words = line.split()
+                    try:
+                        if t.timetag == Timetag.TT_NUMERIC and words[0].isnumeric():
+                            if SKIP == t.skip_numeric_tt_line(int(words[0])):
+                                continue        # this is an out-of-time-window line
+                            else:
+                                words.pop(0)    # read line but do not count its timetag
+                    except (IndexError):
+                        continue                # means empty line, ignore
+                    c.update(Counter(words))    # do the actual word counting
             except (UnicodeDecodeError, PermissionError) as ex:
                 if not ignore_file(path):
                     print("skipping(4) {e} {p}".format(e=ex, p=path))
@@ -102,110 +95,9 @@ def score_file_words(path:str) -> Counter:
             print("skipping(3) {e} {p}".format(e=ex, p=path))
     return c
 
-def walk_tree(path:str, files:List[str]) -> None:
-    if os.path.isdir(path):             # if it's a directory go through its content
-        try:
-            for f in os.listdir(path):
-                pathname = os.path.join(path, f)
-                walk_tree(pathname, files)
-        except (PermissionError) as ex:
-            print("skipping(2) {e}".format(e=ex))
-    elif os.path.isfile(path):
-        files.append(path)
-    else:
-        print("skipping(1) {}".format(path))
-
-
-class CLI:
-    ''' parse command line
-        determine cli type (basic, adv_timestamp, or adv_human)
-        hold input parameters
-    '''
-    def is_valid_time_window(self, time_win:str) -> bool:
-        # Sat Sep 23 00:34:37 - Sun Sep 24 00:34:37
-        WD = 'Sun|Mon|Tue|Wed|Thu|Fri|Sat'
-        MO = 'Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec'
-        MD = '[0-3]\d'   # month day 00, 01, ... 31
-        HR = '[012]\d'
-        MI = '[0-5]\d'
-        SE = MI
-        #        1        2        3        4      5      6            7        8        9        10     11     12
-        pat = r'({wd})\s+({mo})\s+({md})\s+({hr}):({mi}):({se})\s+-\s+({wd})\s+({mo})\s+({md})\s+({hr}):({mi}):({se})'.format(wd=WD, mo=MO, md=MD, hr=HR, mi=MI, se=SE)
-        tw = re.compile(pat, flags=re.ASCII)
-        is_tw = tw.match(time_win)
-        if not is_tw:
-            print("p5 wrong time window: {tw}".format(tw=time_win))
-            return False
-       #print("P2 time_window: {tw}, match: {b}".format(tw=time_win, b=is_tw))
-        hr1 = int(is_tw.group(4))
-        hr2 = int(is_tw.group(10))
-        if hr1 > 23 or hr2 > 23:
-            print("p6 wrong time window: {tw}".format(tw=time_win))
-            return False
-        md1 = int(is_tw.group(3))
-        md2 = int(is_tw.group(9))
-        if md1 > 31 or md2 > 31:
-            print("p7 wrong time window: {tw}".format(tw=time_win))
-            return False
-
-        return True
-
-    def get_cli_type(self, args:List[str]) -> CLI_type:
-        arg = args[0]
-        if os.path.isdir(arg) or os.path.isfile(arg):
-            return CLI_type.BASIC
-        try:                    # maybe it's a timestamp number?
-            int(arg)            # try to convert the argument to a number
-            #:ur: continue... check and save arguments
-            return CLI_type.ADV_TIMESTAMP
-        except ValueError:
-            pass                # no, it's not a timestamp
-
-        time_window_str = ' '.join(args).strip()    # list of strings to one long string
-        time_windows = time_window_str.split(',')   # make a list of time windows
-        time_windows = [tw.strip() for tw in time_windows]
-        for tw in time_windows:
-            if self.is_valid_time_window(tw):
-                tws = tw.split(' - ')
-                tsa = Timestamp_alpha(start=tws[0], end=tws[1])
-               #print("p8 {} {}".format(tw, tsa))
-                Adv_Human.time_windows.append(tsa)
-            else:
-                return CLI_type.NONE
-        else:
-            return CLI_type.ADV_HUMAN
-
-        return CLI_type.NONE
-
-    def __init__(self):
-        usage_msg = "{line_1}{space}{line_2}{space}{line_3}".format(
-                      line_1="usage: max-words TOP_N PATH [PATH ...]\n",
-                      line_2="TOP_N - integer, display the TOP_N most frequent words in the PATH list files\n",
-                      line_3="PATH  - file or directory name",
-                      space =" " * 7)
-        self.type = CLI_type.NONE
-
-        if len(sys.argv) < 3:
-            print(usage_msg)
-            return
-
-        try:
-            self.top_n = int(sys.argv[1])
-        except (ValueError) as ex:
-            print("{x}".format(x=ex))
-            print(usage_msg)
-            return
-
-        if self.top_n < 1:
-            print("ValueError, {} is not an integer with value > 0".format(sys.argv[1]))
-            return
-
-        self.raw_file_list = sys.argv[2:]
-        self.type = self.get_cli_type(sys.argv[2:])
-
-def next_file(files:Iterable[str]) -> str:
-    for f in files:
-        yield f
+def next_task(tasks:Iterable[str]) -> str:
+    for t in tasks:
+        yield t
     return
 
 def print_results(mc:List[Tuple[str,int]]) -> None:      # mc stands for 'most common'
@@ -229,40 +121,26 @@ def check_version() -> bool:
     print("This script was tested with Python 3.6.5, can't run with the current Python version")
     return False
 
-
 def main():
-    global g_cli_type
-    if check_version() == False:
+    if check_version() == False:            # check for the right Python version
         return
-    files = []                      # list of files to traverse
-    cli = CLI()                     # the command line object
-    if cli.type == None:            # means that there was a problem while reading the command line
-        return
+    task_list = []                          # list of Task objects, one per input file
+    fh  = File_Handle(task_list)
+    cli = CLI(fh.file_handle, VERSION)      # the command line parser
+    for msg in cli.cli_log:                 # print messages created by cli object
+        print(msg)                          # during command line parsing
 
-    if cli.type != CLI_type.BASIC and cli.type != CLI_type.ADV_HUMAN:
-        print('p1, CLI_type: {t}'.format(t=cli.type))
-        return
-
-    if cli.type == CLI_type.BASIC:
-        for path in cli.raw_file_list:  # iterate over CLI directories and files
-            walk_tree(path, files)      # recursively go through directory trees and get all containing files
-    elif cli.type == CLI_type.ADV_HUMAN:
-        files.append("/var/log/wifi.log")
-        files.append("/var/log/jamf.log")
-    else:
-        print("p3 cli type {t} is not supported".format(cli.type))
-        return
-
-    g_cli_type = cli.type
-
-    CPUs = os.cpu_count()           # get number of cores
+   #CPUs = os.cpu_count()                   # get number of cores
+    CPUs = min(6, os.cpu_count())
     with Pool(CPUs) as pool:
-        scores = pool.map(score_file_words, next_file(files))
+   #with Pool(1) as pool:       # :ur: 1
+        scores = pool.map(score_file_words, next_task(task_list))
     total_count = Counter()
     for s in scores:
-        total_count.update(s)       # aggregate all counts
+        total_count.update(s)               # aggregate all counts
     mc = total_count.most_common(cli.top_n)
-    print_results(mc)               # print the top_n most common words along with their appearance counter
+    print_results(mc)                       # print the top_n most common words
+                                            # along with their appearance counter
 
     print('\nPython {}.{}.{}'.format(sys.version_info.major, sys.version_info.minor, sys.version_info.micro))
     print('total {n:,} words'.format(n=sum(total_count.values())))
